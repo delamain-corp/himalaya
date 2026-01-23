@@ -155,8 +155,10 @@ impl MessageReadCommand {
                 .await?;
 
             // Extract headers from the parsed email
-            let parsed = email.parsed();
-            let headers = if let Ok(parsed) = parsed {
+            // When --no-headers is specified, headers are omitted from JSON output as well
+            let headers = if self.no_headers {
+                MessageHeaders::default()
+            } else if let Ok(parsed) = email.parsed() {
                 MessageHeaders {
                     from: parsed.from().map(format_address),
                     to: parsed.to().map(format_address),
@@ -175,8 +177,8 @@ impl MessageReadCommand {
             // Extract body from template (the body part after headers)
             let body = extract_body_from_template(&tpl);
 
-            // Use the envelope ID if available, otherwise use index
-            let id = ids.get(idx).map(|s| s.to_string()).unwrap_or_else(|| idx.to_string());
+            // Use the envelope ID from the original request if available
+            let id = ids.get(idx).map(|s| s.to_string()).unwrap_or_default();
 
             structured_messages.push(StructuredMessage {
                 id,
@@ -226,14 +228,21 @@ fn format_address(addr: &mail_parser::Address) -> String {
 }
 
 /// Extracts the body from a template string (after the header section).
+///
+/// # Assumptions
+///
+/// - If headers are present, they appear at the top of the template.
+/// - The end of the header section is marked by the first empty line (`\n\n` or `\r\n\r\n`).
+/// - Everything after that empty line is considered the body.
+/// - If no empty line is found (e.g., when `--no-headers` is used and the
+///   template only contains the body), the entire template is returned.
 fn extract_body_from_template(tpl: &str) -> String {
-    // The template format has headers followed by an empty line, then the body
     if let Some(pos) = tpl.find("\n\n") {
         tpl[pos + 2..].to_string()
     } else if let Some(pos) = tpl.find("\r\n\r\n") {
         tpl[pos + 4..].to_string()
     } else {
-        // If no header separator found, return the whole template as body
+        // No header separator found - template consists solely of the body
         tpl.to_string()
     }
 }
