@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use clap::Parser;
 use color_eyre::Result;
@@ -7,6 +7,7 @@ use pimalaya_tui::{
     himalaya::backend::BackendBuilder,
     terminal::{cli::printer::Printer, config::TomlConfig as _},
 };
+use serde::Serialize;
 use tracing::info;
 
 #[allow(unused)]
@@ -14,6 +15,54 @@ use crate::{
     account::arg::name::AccountNameFlag, config::TomlConfig, envelope::arg::ids::EnvelopeIdsArgs,
     folder::arg::name::FolderNameOptionalFlag,
 };
+
+/// Represents a structured message for JSON output.
+#[derive(Clone, Debug, Serialize)]
+pub struct StructuredMessage {
+    /// The envelope ID of the message.
+    pub id: String,
+    /// The message headers (From, To, Subject, Date, etc.).
+    pub headers: MessageHeaders,
+    /// The plain text body of the message.
+    pub body: String,
+}
+
+/// Represents the headers of a message.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MessageHeaders {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bcc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+}
+
+/// A collection of structured messages.
+#[derive(Clone, Debug, Serialize)]
+pub struct StructuredMessages(Vec<StructuredMessage>);
+
+impl fmt::Display for StructuredMessages {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut glue = "";
+        for msg in &self.0 {
+            write!(f, "{glue}")?;
+            write!(f, "{}", msg.body)?;
+            glue = "\n\n";
+        }
+        Ok(())
+    }
+}
 
 /// Read a human-friendly version of the message associated to the
 /// given envelope id(s).
@@ -90,12 +139,9 @@ impl MessageReadCommand {
             backend.get_messages(folder, ids).await
         }?;
 
-        let mut glue = "";
-        let mut bodies = String::default();
+        let mut structured_messages = Vec::new();
 
-        for email in emails.to_vec() {
-            bodies.push_str(glue);
-
+        for (idx, email) in emails.to_vec().iter().enumerate() {
             let tpl = email
                 .to_read_tpl(&account_config, |mut tpl| {
                     if self.no_headers {
@@ -107,11 +153,96 @@ impl MessageReadCommand {
                     tpl
                 })
                 .await?;
-            bodies.push_str(&tpl);
 
-            glue = "\n\n";
+            // Extract headers from the parsed email
+            // When --no-headers is specified, headers are omitted from JSON output as well
+            let headers = if self.no_headers {
+                MessageHeaders::default()
+            } else if let Ok(parsed) = email.parsed() {
+                MessageHeaders {
+                    from: parsed.from().map(format_address),
+                    to: parsed.to().map(format_address),
+                    cc: parsed.cc().map(format_address),
+                    bcc: parsed.bcc().map(format_address),
+                    subject: parsed.subject().map(|s| s.to_string()),
+                    date: parsed.date().map(|d| d.to_rfc3339()),
+                    message_id: parsed.message_id().map(|s| s.to_string()),
+                    in_reply_to: parsed.in_reply_to().as_text_list()
+                        .and_then(|ids| ids.first().map(|s| s.to_string())),
+                }
+            } else {
+                MessageHeaders::default()
+            };
+
+            // Extract body from template (the body part after headers)
+            let body = extract_body_from_template(&tpl);
+
+            // Use the envelope ID from the original request if available
+            let id = ids.get(idx).map(|s| s.to_string()).unwrap_or_default();
+
+            structured_messages.push(StructuredMessage {
+                id,
+                headers,
+                body,
+            });
         }
 
-        printer.out(bodies)
+        printer.out(StructuredMessages(structured_messages))
+    }
+}
+
+/// Formats an Address to a human-readable string.
+fn format_address(addr: &mail_parser::Address) -> String {
+    match addr {
+        mail_parser::Address::List(addrs) => {
+            addrs
+                .iter()
+                .filter_map(|a| {
+                    match (&a.name, &a.address) {
+                        (Some(name), Some(email)) => Some(format!("{} <{}>", name, email)),
+                        (None, Some(email)) => Some(email.to_string()),
+                        (Some(name), None) => Some(name.to_string()),
+                        (None, None) => None,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        mail_parser::Address::Group(groups) => {
+            groups
+                .iter()
+                .map(|g| {
+                    let name = g.name.as_deref().unwrap_or("");
+                    let members = g
+                        .addresses
+                        .iter()
+                        .filter_map(|a| a.address.as_ref().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{}: {};", name, members)
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+}
+
+/// Extracts the body from a template string (after the header section).
+///
+/// # Assumptions
+///
+/// - If headers are present, they appear at the top of the template.
+/// - The end of the header section is marked by the first empty line (`\n\n` or `\r\n\r\n`).
+/// - Everything after that empty line is considered the body.
+/// - If no empty line is found (e.g., when `--no-headers` is used and the
+///   template only contains the body), the entire template is returned.
+fn extract_body_from_template(tpl: &str) -> String {
+    if let Some(pos) = tpl.find("\n\n") {
+        tpl[pos + 2..].to_string()
+    } else if let Some(pos) = tpl.find("\r\n\r\n") {
+        tpl[pos + 4..].to_string()
+    } else {
+        // No header separator found - template consists solely of the body
+        tpl.to_string()
     }
 }
